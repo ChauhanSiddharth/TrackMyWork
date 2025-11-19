@@ -1,0 +1,208 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15-alpine
+    container_name: trackmywork-db
+    environment:
+      POSTGRES_DB: trackmywork
+      POSTGRES_USER: trackmywork
+      POSTGRES_PASSWORD: trackmywork123
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database-schema.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U trackmywork"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trackmywork-network
+
+  # Redis for caching and Celery broker
+  redis:
+    image: redis:7-alpine
+    container_name: trackmywork-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - trackmywork-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: trackmywork-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://trackmywork:trackmywork123@db:5432/trackmywork
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-encryption-key-32-bytes-long}
+      ACCESS_TOKEN_EXPIRE_MINUTES: 60
+      REFRESH_TOKEN_EXPIRE_DAYS: 7
+      ENVIRONMENT: development
+      ALLOWED_ORIGINS: http://localhost:3000,http://localhost:8000
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - backend_cache:/app/.cache
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+
+  # Celery Worker for background tasks
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: trackmywork-celery-worker
+    environment:
+      DATABASE_URL: postgresql://trackmywork:trackmywork123@db:5432/trackmywork
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-encryption-key-32-bytes-long}
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+    command: celery -A app.workers.celery_app worker --loglevel=info
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+
+  # Celery Beat for scheduled tasks
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: trackmywork-celery-beat
+    environment:
+      DATABASE_URL: postgresql://trackmywork:trackmywork123@db:5432/trackmywork
+      REDIS_URL: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-dev-encryption-key-32-bytes-long}
+      PYTHONUNBUFFERED: 1
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - celery_beat_data:/app/celerybeat-schedule
+    command: celery -A app.workers.celery_app beat --loglevel=info
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+
+  # Celery Flower for monitoring (optional)
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: trackmywork-flower
+    ports:
+      - "5555:5555"
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FLOWER_PORT: 5555
+    depends_on:
+      - redis
+      - celery-worker
+    command: celery -A app.workers.celery_app flower --port=5555
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+
+  # Next.js Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: development
+    container_name: trackmywork-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_APP_NAME: TrackMyWork
+      NODE_ENV: development
+    depends_on:
+      - backend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    command: npm run dev
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+
+  # pgAdmin for database management (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: trackmywork-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@trackmywork.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
+    depends_on:
+      - db
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - trackmywork-network
+    restart: unless-stopped
+    profiles:
+      - tools
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_cache:
+    driver: local
+  celery_beat_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+networks:
+  trackmywork-network:
+    driver: bridge
+
+# Usage:
+# Start all services: docker-compose up -d
+# Start without optional tools: docker-compose up -d
+# Start with pgAdmin: docker-compose --profile tools up -d
+# View logs: docker-compose logs -f [service-name]
+# Stop all: docker-compose down
+# Remove volumes: docker-compose down -v
